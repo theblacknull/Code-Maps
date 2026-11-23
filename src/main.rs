@@ -337,24 +337,9 @@ struct App {
 
 impl App {
     fn new(path: &str) -> Self {
-        let graph_path = PathBuf::from(path);
-        let ua_dir = graph_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
-        // Thư mục dự án là cha của .ua (hoặc chính thư mục chứa file nếu không phải .ua)
-        let project_root = if ua_dir.file_name().map(|n| n == ".ua" || n == ".understand-anything").unwrap_or(false) {
-            ua_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
-        } else {
-            ua_dir.clone()
-        };
-        let (graph, err) = match std::fs::read_to_string(&graph_path)
-            .map_err(|e| e.to_string())
-            .and_then(|s| serde_json::from_str::<Graph>(&s).map_err(|e| e.to_string()))
-        {
-            Ok(g) => (g, None),
-            Err(e) => (Graph::default(), Some(format!("{}: {e}", graph_path.display()))),
-        };
-        let diff = std::fs::read_to_string(ua_dir.join("diff-overlay.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str::<DiffOverlay>(&s).ok());
+        let graph_path = PathBuf::new();
+        let ua_dir = PathBuf::from(".");
+        let project_root = PathBuf::from(".");
 
         let cat_on = NODE_CATEGORIES.iter().map(|&c| (c, true)).collect();
         let edge_cat_on = EDGE_CATEGORIES.iter().map(|&(c, _)| (c, true)).collect();
@@ -365,7 +350,7 @@ impl App {
             ua_dir,
             source: ViewSource::Structure,
             graph: Graph::default(),
-            load_error: err,
+            load_error: None,
             by_id: HashMap::new(),
             layer_of_node: Vec::new(),
             degree: Vec::new(),
@@ -397,7 +382,7 @@ impl App {
             accent: 0,
             theme_open: false,
             persona: Persona::Junior,
-            diff,
+            diff: None,
             diff_on: false,
             path_open: false,
             path_from: None,
@@ -410,7 +395,7 @@ impl App {
             back: Vec::new(),
             forward: Vec::new(),
         };
-        app.set_graph(graph);
+        app.open_path(PathBuf::from(path));
         app
     }
 
@@ -769,6 +754,60 @@ impl App {
         });
     }
 
+    /// Mở một file knowledge-graph.json hoặc thư mục dự án (có .ua/ hoặc .understand-anything/).
+    fn open_path(&mut self, p: PathBuf) {
+        let file = if p.is_dir() {
+            [".ua", ".understand-anything"]
+                .iter()
+                .map(|d| p.join(d).join("knowledge-graph.json"))
+                .find(|f| f.is_file())
+                .unwrap_or_else(|| p.join(".ua").join("knowledge-graph.json"))
+        } else {
+            p
+        };
+        let ua_dir = file.parent().map(|x| x.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+        let project_root = if ua_dir.file_name().map(|n| n == ".ua" || n == ".understand-anything").unwrap_or(false) {
+            ua_dir.parent().map(|x| x.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
+        } else {
+            ua_dir.clone()
+        };
+        let parsed = std::fs::read_to_string(&file)
+            .map_err(|e| e.to_string())
+            .and_then(|s| serde_json::from_str::<Graph>(&s).map_err(|e| e.to_string()));
+        match parsed {
+            Ok(g) => {
+                self.diff = std::fs::read_to_string(ua_dir.join("diff-overlay.json"))
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<DiffOverlay>(&s).ok());
+                self.diff_on = false;
+                self.project_root = project_root;
+                self.graph_path = file;
+                self.ua_dir = ua_dir;
+                self.source = ViewSource::Structure;
+                self.load_error = None;
+                self.pos_override.clear();
+                self.set_graph(g);
+                self.fit_pending = 60;
+            }
+            Err(e) => {
+                self.load_error = Some(format!("{}: {e}", file.display()));
+                self.set_graph(Graph::default());
+            }
+        }
+    }
+
+    fn import_file(&mut self) {
+        if let Some(p) = rfd::FileDialog::new().add_filter("knowledge-graph", &["json"]).pick_file() {
+            self.open_path(p);
+        }
+    }
+
+    fn import_folder(&mut self) {
+        if let Some(p) = rfd::FileDialog::new().pick_folder() {
+            self.open_path(p);
+        }
+    }
+
     fn source_label(&self) -> String {
         self.project_root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "knowledge graph".into())
     }
@@ -826,6 +865,11 @@ impl eframe::App for App {
         visuals.override_text_color = Some(pal.ink);
         ctx.set_visuals(visuals);
 
+        // Kéo thả file knowledge-graph.json hoặc thư mục dự án vào cửa sổ để mở
+        if let Some(p) = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).find(|p| !p.as_os_str().is_empty())) {
+            self.open_path(p);
+        }
+
         // Hẹp: ẩn panel bên để dành chỗ cho canvas (layout mobile)
         let narrow = ctx.content_rect().width() < 760.0;
 
@@ -871,60 +915,65 @@ impl eframe::App for App {
             }
         }
 
-        // Thanh trên: chế độ nguồn, theme, persona, xuất, đường đi, chế độ hẹp.
+        // Thanh trên tối giản: tên dự án, mở dự án, chi tiết, và menu "Tùy chọn" cho phần còn lại.
         egui::Panel::top("top")
-            .frame(egui::Frame::new().fill(pal.surface).stroke(Stroke::new(1.0, pal.border)).inner_margin(egui::Margin::symmetric(12, 8)))
+            .frame(egui::Frame::new().fill(pal.surface).stroke(Stroke::new(1.0, pal.border)).inner_margin(egui::Margin::symmetric(12, 6)))
             .show_inside(root, |ui| {
-            ui.horizontal_wrapped(|ui| {
+            ui.horizontal(|ui| {
                 if narrow && ui.button(if self.show_left { "Ẩn danh sách" } else { "Danh sách" }).clicked() {
                     self.show_left = !self.show_left;
                 }
-                if ui.selectable_label(self.show_right, "Chi tiết").clicked() {
-                    self.show_right = !self.show_right;
-                }
-                ui.separator();
-                if ui.selectable_label(self.source == ViewSource::Structure, "Cấu trúc").clicked() {
-                    self.switch_source(ViewSource::Structure);
-                }
-                if ui.selectable_label(self.source == ViewSource::Domain, "Domain").clicked() {
-                    self.switch_source(ViewSource::Domain);
-                }
-                if ui.selectable_label(self.source == ViewSource::Knowledge, "Kiến thức").clicked() {
-                    self.switch_source(ViewSource::Knowledge);
-                }
-                ui.separator();
-                if self.diff.is_some() {
-                    ui.checkbox(&mut self.diff_on, "Thay đổi (diff)");
-                } else {
-                    ui.add_enabled(false, egui::Button::new("Thay đổi (diff)")).on_disabled_hover_text("Không có .ua/diff-overlay.json");
-                }
-                if ui.button("Đường đi").clicked() {
-                    self.path_open = !self.path_open;
-                }
-                if ui.button("Theme").clicked() {
-                    self.theme_open = !self.theme_open;
-                }
-                egui::ComboBox::from_id_salt("persona").selected_text(self.persona.label()).show_ui(ui, |ui| {
-                    for p in [Persona::NonTechnical, Persona::Junior, Persona::Experienced] {
-                        ui.selectable_value(&mut self.persona, p, p.label());
-                    }
-                });
-                ui.menu_button("Xuất", |ui| {
-                    if ui.button("SVG").clicked() {
-                        self.export("svg");
+                ui.label(egui::RichText::new(self.source_label()).strong().size(15.0));
+                ui.menu_button("Mở", |ui| {
+                    if ui.button("Mở file knowledge-graph.json…").clicked() {
+                        self.import_file();
                         ui.close();
                     }
-                    if ui.button("Markdown").clicked() {
-                        self.export("md");
-                        ui.close();
-                    }
-                    if ui.button("JSON").clicked() {
-                        self.export("json");
+                    if ui.button("Mở thư mục dự án…").clicked() {
+                        self.import_folder();
                         ui.close();
                     }
                 });
-                ui.checkbox(&mut self.minimap, "Minimap (M)");
-                ui.checkbox(&mut self.show_all_edges, "Mọi cạnh");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.menu_button("Tùy chọn", |ui| {
+                        if ui.button("Tìm đường đi…").clicked() {
+                            self.path_open = !self.path_open;
+                            ui.close();
+                        }
+                        if ui.button("Giao diện…").clicked() {
+                            self.theme_open = !self.theme_open;
+                            ui.close();
+                        }
+                        ui.menu_button("Xuất", |ui| {
+                            if ui.button("SVG").clicked() {
+                                self.export("svg");
+                                ui.close();
+                            }
+                            if ui.button("Markdown").clicked() {
+                                self.export("md");
+                                ui.close();
+                            }
+                            if ui.button("JSON").clicked() {
+                                self.export("json");
+                                ui.close();
+                            }
+                        });
+                        ui.separator();
+                        ui.checkbox(&mut self.minimap, "Bản đồ nhỏ (M)");
+                        ui.checkbox(&mut self.show_all_edges, "Hiện mọi cạnh");
+                        if self.diff.is_some() {
+                            ui.checkbox(&mut self.diff_on, "Hiện thay đổi (diff)");
+                        }
+                        ui.separator();
+                        ui.label(egui::RichText::new("Chế độ xem").color(pal.muted).small());
+                        for p in [Persona::NonTechnical, Persona::Junior, Persona::Experienced] {
+                            ui.radio_value(&mut self.persona, p, p.label());
+                        }
+                    });
+                    if ui.selectable_label(self.show_right, "Chi tiết").clicked() {
+                        self.show_right = !self.show_right;
+                    }
+                });
             });
             if let Some(msg) = &self.export_msg {
                 ui.label(egui::RichText::new(msg).color(pal.muted).small());
@@ -967,16 +1016,11 @@ impl eframe::App for App {
                 .default_size(272.0)
                 .frame(egui::Frame::new().fill(pal.surface).stroke(Stroke::new(1.0, pal.border)).inner_margin(egui::Margin::symmetric(14, 14)))
                 .show_inside(root, |ui| {
-                ui.label(egui::RichText::new(self.source_label()).strong().size(18.0));
                 ui.label(
                     egui::RichText::new(format!("{} nodes · {} edges · {} layers", self.graph.nodes.len(), self.graph.edges.len(), self.graph.layers.len()))
                         .color(pal.muted)
                         .size(12.0),
                 );
-                if let Some(err) = &self.load_error {
-                    ui.add_space(6.0);
-                    ui.colored_label(Color32::from_rgb(180, 0, 0), err);
-                }
 
                 ui.add_space(10.0);
                 let resp = ui.add(
@@ -1002,9 +1046,6 @@ impl eframe::App for App {
                 }
 
                 section(ui, "Layer");
-                if self.level != Level::Overview && ui.small_button("← Tổng quan").clicked() {
-                    self.go_overview();
-                }
                 let mut open = None;
                 for (i, layer) in self.graph.layers.iter().enumerate() {
                     let selected = self.level == Level::Layer(i);
@@ -1042,7 +1083,7 @@ impl eframe::App for App {
                     self.enter_layer(i);
                 }
 
-                section(ui, "Công cụ");
+                ui.add_space(10.0);
                 egui::CollapsingHeader::new("Bộ lọc").default_open(false).show(ui, |ui| {
                     let mut changed = false;
                     for c in NODE_CATEGORIES {
@@ -1063,7 +1104,7 @@ impl eframe::App for App {
                         self.rebuild_view();
                     }
                 });
-                egui::CollapsingHeader::new(format!("Tour · {} bước", self.graph.tour.len())).default_open(true).show(ui, |ui| {
+                egui::CollapsingHeader::new(format!("Tour · {} bước", self.graph.tour.len())).default_open(false).show(ui, |ui| {
                     if self.graph.tour.is_empty() {
                         ui.label(egui::RichText::new("Dự án này chưa có tour.").color(pal.muted));
                     } else if self.tour_active {
@@ -1098,17 +1139,6 @@ impl eframe::App for App {
                     }
                 });
 
-                ui.add_space(14.0);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.small_button("Xóa làm nổi bật").clicked() {
-                        self.highlight.clear();
-                        self.path_nodes.clear();
-                    }
-                    if ui.small_button("Phím tắt (H)").clicked() {
-                        self.show_help = true;
-                    }
-                });
             });
         }
 
@@ -1243,6 +1273,26 @@ impl eframe::App for App {
 
         // Canvas
         egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.bg)).show(root, |ui| {
+            // Chưa có dữ liệu: màn hình mở dự án
+            if self.graph.nodes.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() / 3.0);
+                    ui.label(egui::RichText::new("Chưa có dự án nào được mở").strong().size(20.0));
+                    ui.label(egui::RichText::new("Mở file knowledge-graph.json hoặc thư mục dự án có thư mục .ua/. Cũng có thể kéo thả file vào cửa sổ.").color(pal.muted));
+                    if let Some(err) = &self.load_error {
+                        ui.add_space(8.0);
+                        ui.colored_label(Color32::from_rgb(180, 0, 0), truncate(err, 140));
+                    }
+                    ui.add_space(14.0);
+                    if ui.button("Mở file knowledge-graph.json…").clicked() {
+                        self.import_file();
+                    }
+                    if ui.button("Mở thư mục dự án…").clicked() {
+                        self.import_folder();
+                    }
+                });
+                return;
+            }
             let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
             let origin = response.rect.min;
             self.canvas_rect = response.rect;

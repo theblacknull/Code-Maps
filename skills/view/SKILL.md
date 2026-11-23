@@ -18,8 +18,8 @@ Open the knowledge graph in the native viewer.
 3. Tell the user the window is open and summarise the controls:
    - Drag the background to pan. Scroll or use the + / − buttons to zoom. "Quay lại" and "Đi tiếp" move between the overview and layers.
    - Click a layer card or a layer in the left list to open it. Click a node to select it.
-   - Press "Chi tiết" in the top bar to open the details panel. Double-click a node to open its source.
+   - Press "Chi tiết" in the top bar to open the details panel. Double-click a node to open its source. Use "Mở" to open another knowledge-graph.json or project folder, or drag a file into the window.
    - Use the Tour section in the left panel to highlight a step's nodes. Press `F` to fit the graph to the window.
-   - Tick "Mọi cạnh" to draw every edge.
+   - Tick "Hiện mọi cạnh" in the "Tùy chọn" menu to draw every edge.
 
 Do not modify the graph file.
