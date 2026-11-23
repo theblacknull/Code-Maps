@@ -491,11 +491,7 @@ impl App {
         self.view_links.clear();
         match self.level {
             Level::Overview => {
-                let ids: Vec<String> = (0..self.graph.layers.len()).map(|i| format!("layer:{i}")).collect();
-                let dims: Vec<(f32, f32)> = self.graph.layers.iter().map(|_| (300.0, 150.0)).collect();
-                let community = vec![None; ids.len()];
-                let links: Vec<(usize, usize)> = self.layer_links.iter().map(|&(a, b, _)| (a, b)).collect();
-                let pos = layout::force_layout(&layout::Input { ids: &ids, dims: &dims, community: &community, links: &links });
+                let pos = overview_positions(self.graph.layers.len(), &self.layer_links);
                 for (i, p) in pos.iter().enumerate() {
                     let at = self.pos_override.get(&(0, i)).copied().unwrap_or(Pos2::new(p.0, p.1));
                     self.cards.push(Card { kind: CardKind::Layer(i), rect: Rect::from_min_size(at, Vec2::new(300.0, 150.0)) });
@@ -813,6 +809,63 @@ impl App {
     }
 }
 
+/// Bố cục tổng quan: các layer xếp thành cột theo khoảng cách (BFS) từ layer nối nhiều nhất,
+/// đọc từ trái sang phải; mỗi cột được căn giữa theo chiều dọc.
+fn overview_positions(n: usize, links: &[(usize, usize, usize)]) -> Vec<(f32, f32)> {
+    const CW: f32 = 300.0;
+    const CH: f32 = 150.0;
+    const GX: f32 = 110.0;
+    const GY: f32 = 48.0;
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut deg = vec![0usize; n];
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for &(a, b, c) in links {
+        deg[a] += c;
+        deg[b] += c;
+        adj[a].push(b);
+        adj[b].push(a);
+    }
+    let root = (0..n).max_by_key(|&i| deg[i]).unwrap_or(0);
+    let mut depth = vec![usize::MAX; n];
+    depth[root] = 0;
+    let mut q = VecDeque::from([root]);
+    while let Some(c) = q.pop_front() {
+        for &nb in &adj[c] {
+            if depth[nb] == usize::MAX {
+                depth[nb] = depth[c] + 1;
+                q.push_back(nb);
+            }
+        }
+    }
+    let far = depth.iter().filter(|&&d| d != usize::MAX).max().copied().unwrap_or(0);
+    for d in depth.iter_mut() {
+        if *d == usize::MAX {
+            *d = far + 1;
+        }
+    }
+    let cols = depth.iter().max().copied().unwrap_or(0) + 1;
+    let mut columns: Vec<Vec<usize>> = vec![Vec::new(); cols];
+    for i in 0..n {
+        columns[depth[i]].push(i);
+    }
+    for col in columns.iter_mut() {
+        col.sort_by_key(|&i| std::cmp::Reverse(deg[i]));
+    }
+    let tallest = columns.iter().map(|c| c.len()).max().unwrap_or(1) as f32;
+    let full_h = tallest * CH + (tallest - 1.0) * GY;
+    let mut pos = vec![(0.0, 0.0); n];
+    for (c, col) in columns.iter().enumerate() {
+        let h = col.len() as f32 * CH + (col.len() as f32 - 1.0).max(0.0) * GY;
+        let top = (full_h - h) / 2.0;
+        for (r, &i) in col.iter().enumerate() {
+            pos[i] = (c as f32 * (CW + GX), top + r as f32 * (CH + GY));
+        }
+    }
+    pos
+}
+
 /// Bóng đổ mềm: ba lớp alpha giảm dần, lệch xuống, tạo độ sâu không cần blur.
 fn card_shadow(painter: &egui::Painter, rect: Rect, radius: f32) {
     for (grow, dy, alpha) in [(6.0, 6.0, 6u8), (3.0, 3.0, 10u8), (1.0, 1.0, 16u8)] {
@@ -886,8 +939,6 @@ impl eframe::App for App {
             self.open_path(p);
         }
 
-        // Hẹp: ẩn panel bên để dành chỗ cho canvas (layout mobile)
-        let narrow = ctx.content_rect().width() < 760.0;
 
         // Phím tắt
         let (esc, slash, left, right, help, minimap_key, fit_key) = ctx.input(|i| {
@@ -936,10 +987,12 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(pal.surface).stroke(Stroke::new(1.0, pal.border)).inner_margin(egui::Margin::symmetric(12, 6)))
             .show_inside(root, |ui| {
             ui.horizontal(|ui| {
-                if narrow && ui.button(if self.show_left { "Ẩn danh sách" } else { "Danh sách" }).clicked() {
-                    self.show_left = !self.show_left;
-                }
                 ui.label(egui::RichText::new(self.source_label()).strong().size(15.0));
+                ui.label(
+                    egui::RichText::new(format!("{} nodes · {} edges · {} layers", self.graph.nodes.len(), self.graph.edges.len(), self.graph.layers.len()))
+                        .color(pal.muted)
+                        .size(12.0),
+                );
                 ui.menu_button("Mở", |ui| {
                     if ui.button("Mở file knowledge-graph.json…").clicked() {
                         self.import_file();
@@ -972,6 +1025,39 @@ impl eframe::App for App {
                             if ui.button("JSON").clicked() {
                                 self.export("json");
                                 ui.close();
+                            }
+                        });
+                        ui.menu_button("Tour", |ui| {
+                            if self.graph.tour.is_empty() {
+                                ui.label(egui::RichText::new("Dự án này chưa có tour.").color(pal.muted));
+                            }
+                            for (i, step) in self.graph.tour.clone().iter().enumerate() {
+                                if ui.button(format!("{}. {}", step.order, step.title)).clicked() {
+                                    self.tour_active = true;
+                                    self.tour_step = i;
+                                    self.tour_highlight();
+                                    ui.close();
+                                }
+                            }
+                        });
+                        ui.menu_button("Lọc", |ui| {
+                            let mut changed = false;
+                            for c in NODE_CATEGORIES {
+                                let mut on = *self.cat_on.get(c).unwrap_or(&true);
+                                if ui.checkbox(&mut on, format!("Node: {c}")).changed() {
+                                    self.cat_on.insert(c, on);
+                                    changed = true;
+                                }
+                            }
+                            for (c, _) in EDGE_CATEGORIES {
+                                let mut on = *self.edge_cat_on.get(c).unwrap_or(&true);
+                                if ui.checkbox(&mut on, format!("Cạnh: {c}")).changed() {
+                                    self.edge_cat_on.insert(c, on);
+                                    changed = true;
+                                }
+                            }
+                            if changed && matches!(self.level, Level::Layer(_)) {
+                                self.rebuild_view();
                             }
                         });
                         ui.separator();
@@ -1022,139 +1108,6 @@ impl eframe::App for App {
                 if ui.button("Đóng").clicked() {
                     self.theme_open = false;
                 }
-            });
-        }
-
-        // Panel trái: nguồn, tìm kiếm, layer có màu, bộ lọc, tour
-        if self.show_left || !narrow {
-            egui::Panel::left("left")
-                .resizable(true)
-                .default_size(272.0)
-                .frame(egui::Frame::new().fill(pal.surface).stroke(Stroke::new(1.0, pal.border)).inner_margin(egui::Margin::symmetric(14, 14)))
-                .show_inside(root, |ui| {
-                ui.label(
-                    egui::RichText::new(format!("{} nodes · {} edges · {} layers", self.graph.nodes.len(), self.graph.edges.len(), self.graph.layers.len()))
-                        .color(pal.muted)
-                        .size(12.0),
-                );
-
-                ui.add_space(10.0);
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.query)
-                        .id(Id::new("search-box"))
-                        .hint_text("Tìm node…  ( / )")
-                        .desired_width(f32::INFINITY),
-                );
-                if resp.changed() {
-                    self.run_search();
-                }
-                if !self.search_hits.is_empty() {
-                    ui.label(egui::RichText::new(format!("{} kết quả", self.search_hits.len())).color(pal.muted).size(12.0));
-                    let hits = self.search_hits.clone();
-                    egui::ScrollArea::vertical().max_height(160.0).id_salt("hits").show(ui, |ui| {
-                        for ni in hits {
-                            let label = format!("{}  · {}", self.graph.nodes[ni].name, self.graph.nodes[ni].kind);
-                            if ui.selectable_label(false, label).clicked() {
-                                self.navigate_to_node(ni);
-                            }
-                        }
-                    });
-                }
-
-                section(ui, "Layer");
-                let mut open = None;
-                for (i, layer) in self.graph.layers.iter().enumerate() {
-                    let selected = self.level == Level::Layer(i);
-                    let tone = hex(LAYER_COLORS[i % LAYER_COLORS.len()]);
-                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::click());
-                    let bg = if selected {
-                        mix(pal.surface, tone, 0.14)
-                    } else if resp.hovered() {
-                        mix(pal.surface, tone, 0.06)
-                    } else {
-                        pal.surface
-                    };
-                    let p = ui.painter();
-                    p.rect_filled(rect, 6.0, bg);
-                    p.circle_filled(Pos2::new(rect.min.x + 12.0, rect.center().y), 4.5, tone);
-                    p.text(
-                        Pos2::new(rect.min.x + 26.0, rect.center().y),
-                        Align2::LEFT_CENTER,
-                        truncate(&layer.name, 24),
-                        FontId::new(13.0, egui::FontFamily::Name("medium".into())),
-                        pal.ink,
-                    );
-                    p.text(
-                        Pos2::new(rect.max.x - 10.0, rect.center().y),
-                        Align2::RIGHT_CENTER,
-                        layer.node_ids.len().to_string(),
-                        FontId::proportional(12.0),
-                        pal.muted,
-                    );
-                    if resp.clicked() {
-                        open = Some(i);
-                    }
-                }
-                if let Some(i) = open {
-                    self.enter_layer(i);
-                }
-
-                ui.add_space(10.0);
-                egui::CollapsingHeader::new("Bộ lọc").default_open(false).show(ui, |ui| {
-                    let mut changed = false;
-                    for c in NODE_CATEGORIES {
-                        let mut on = *self.cat_on.get(c).unwrap_or(&true);
-                        if ui.checkbox(&mut on, format!("Loại: {c}")).changed() {
-                            self.cat_on.insert(c, on);
-                            changed = true;
-                        }
-                    }
-                    for (c, _) in EDGE_CATEGORIES {
-                        let mut on = *self.edge_cat_on.get(c).unwrap_or(&true);
-                        if ui.checkbox(&mut on, format!("Cạnh: {c}")).changed() {
-                            self.edge_cat_on.insert(c, on);
-                            changed = true;
-                        }
-                    }
-                    if changed && matches!(self.level, Level::Layer(_)) {
-                        self.rebuild_view();
-                    }
-                });
-                egui::CollapsingHeader::new(format!("Tour · {} bước", self.graph.tour.len())).default_open(false).show(ui, |ui| {
-                    if self.graph.tour.is_empty() {
-                        ui.label(egui::RichText::new("Dự án này chưa có tour.").color(pal.muted));
-                    } else if self.tour_active {
-                        let n = self.graph.tour.len();
-                        if let Some(step) = self.graph.tour.get(self.tour_step).cloned() {
-                            ui.horizontal(|ui| {
-                                if ui.button("◀").clicked() && self.tour_step > 0 {
-                                    self.tour_step -= 1;
-                                    self.tour_highlight();
-                                }
-                                ui.label(format!("{} / {}", self.tour_step + 1, n));
-                                if ui.button("▶").clicked() && self.tour_step + 1 < n {
-                                    self.tour_step += 1;
-                                    self.tour_highlight();
-                                }
-                                if ui.small_button("Thoát").clicked() {
-                                    self.tour_active = false;
-                                    self.highlight.clear();
-                                }
-                            });
-                            ui.label(egui::RichText::new(format!("{}. {}", step.order, step.title)).strong());
-                            ui.label(egui::RichText::new(&step.description).color(pal.muted).size(12.0));
-                        }
-                    } else {
-                        for (i, step) in self.graph.tour.clone().iter().enumerate() {
-                            if ui.selectable_label(false, format!("{}. {}", step.order, step.title)).clicked() {
-                                self.tour_active = true;
-                                self.tour_step = i;
-                                self.tour_highlight();
-                            }
-                        }
-                    }
-                });
-
             });
         }
 
@@ -1288,6 +1241,89 @@ impl eframe::App for App {
         }
 
         // Canvas
+        // Ô tìm kiếm nhỏ ở góc trên bên phải canvas (phím /)
+        let mut search_pick = None;
+        egui::Area::new(Id::new("search-area"))
+            .anchor(Align2::RIGHT_TOP, Vec2::new(-14.0, 56.0))
+            .order(egui::Order::Foreground)
+            .show(&ctx, |ui| {
+                egui::Frame::new()
+                    .fill(pal.surface)
+                    .stroke(Stroke::new(1.0, pal.border))
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.set_width(220.0);
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.query)
+                                .id(Id::new("search-box"))
+                                .hint_text("Tìm node…  ( / )")
+                                .frame(egui::Frame::NONE)
+                                .desired_width(f32::INFINITY),
+                        );
+                        if resp.changed() {
+                            self.run_search();
+                        }
+                        if !self.query.trim().is_empty() {
+                            ui.separator();
+                            if self.search_hits.is_empty() {
+                                ui.label(egui::RichText::new("Không có kết quả").color(pal.muted).size(12.0));
+                            }
+                            for &ni in self.search_hits.iter().take(8) {
+                                let n = &self.graph.nodes[ni];
+                                if ui.selectable_label(false, format!("{}  · {}", truncate(&n.name, 26), n.kind)).clicked() {
+                                    search_pick = Some(ni);
+                                }
+                            }
+                        }
+                    });
+            });
+        if let Some(ni) = search_pick {
+            self.navigate_to_node(ni);
+            self.query.clear();
+            self.search_hits.clear();
+        }
+
+        // Thanh tour khi đang chạy tour: đặt ở giữa phía dưới canvas
+        if self.tour_active {
+            if let Some(step) = self.graph.tour.get(self.tour_step).cloned() {
+                let n = self.graph.tour.len();
+                let mut go = 0i32;
+                let mut stop = false;
+                egui::Area::new(Id::new("tour-bar"))
+                    .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -14.0))
+                    .order(egui::Order::Foreground)
+                    .show(&ctx, |ui| {
+                        egui::Frame::new()
+                            .fill(pal.surface)
+                            .stroke(Stroke::new(1.0, pal.border))
+                            .corner_radius(egui::CornerRadius::same(8))
+                            .inner_margin(egui::Margin::symmetric(10, 6))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui.add_enabled(self.tour_step > 0, egui::Button::new("Trước")).clicked() {
+                                        go = -1;
+                                    }
+                                    ui.label(egui::RichText::new(format!("{}/{}  {}", self.tour_step + 1, n, truncate(&step.title, 40))).strong());
+                                    if ui.add_enabled(self.tour_step + 1 < n, egui::Button::new("Sau")).clicked() {
+                                        go = 1;
+                                    }
+                                    if ui.button("Thoát").clicked() {
+                                        stop = true;
+                                    }
+                                });
+                            });
+                    });
+                if stop {
+                    self.tour_active = false;
+                    self.highlight.clear();
+                } else if go != 0 {
+                    self.tour_step = (self.tour_step as i32 + go) as usize;
+                    self.tour_highlight();
+                }
+            }
+        }
+
         egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.bg)).show(root, |ui| {
             // Chưa có dữ liệu: màn hình mở dự án
             if self.graph.nodes.is_empty() {
