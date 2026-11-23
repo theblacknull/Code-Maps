@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "code-maps",
+  "description": "Developer tools for reading codebases.",
+  "owner": {
+    "name": "theblacknull",
+    "url": "https://github.com/theblacknull"
+  },
+  "plugins": [
+    {
+      "name": "ua-viewer",
+      "description": "Native viewer for Understand-Anything knowledge graphs.",
+      "source": "./",
+      "category": "developer-tools"
+    }
+  ]
+}

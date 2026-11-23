@@ -1,0 +1,9 @@
+{
+  "name": "ua-viewer",
+  "description": "Native Rust (egui) viewer for knowledge-graph.json from Understand-Anything: layer overview, drill-in node graph, tour highlights and export.",
+  "version": "0.1.0",
+  "author": { "name": "theblacknull" },
+  "repository": "https://github.com/theblacknull/Code-Maps",
+  "license": "MIT",
+  "keywords": ["knowledge-graph", "architecture", "viewer", "rust", "egui"]
+}
