@@ -368,7 +368,7 @@ impl App {
             highlight: HashSet::new(),
             path_nodes: HashSet::new(),
             show_all_edges: false,
-            minimap: true,
+            minimap: false,
             query: String::new(),
             search_hits: Vec::new(),
             cat_on,
@@ -863,6 +863,22 @@ impl eframe::App for App {
         visuals.panel_fill = pal.surface;
         visuals.window_fill = pal.surface;
         visuals.override_text_color = Some(pal.ink);
+        // Nút và ô nhập: một kiểu phẳng, bo góc nhỏ, viền mảnh (thay cho nút xám mặc định)
+        let radius = egui::CornerRadius::same(6);
+        for w in [&mut visuals.widgets.inactive, &mut visuals.widgets.hovered, &mut visuals.widgets.active, &mut visuals.widgets.open] {
+            w.corner_radius = radius;
+        }
+        visuals.widgets.inactive.weak_bg_fill = pal.surface;
+        visuals.widgets.inactive.bg_fill = pal.surface;
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, pal.border);
+        let hover_fill = mix(pal.surface, pal.border, 0.6);
+        visuals.widgets.hovered.weak_bg_fill = hover_fill;
+        visuals.widgets.hovered.bg_fill = hover_fill;
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, mix(pal.surface, pal.ink, 0.25));
+        let press_fill = mix(pal.surface, pal.border, 0.9);
+        visuals.widgets.active.weak_bg_fill = press_fill;
+        visuals.widgets.active.bg_fill = press_fill;
+        visuals.selection.bg_fill = mix(pal.surface, pal.accent, 0.22);
         ctx.set_visuals(visuals);
 
         // Kéo thả file knowledge-graph.json hoặc thư mục dự án vào cửa sổ để mở
@@ -1338,6 +1354,12 @@ impl eframe::App for App {
                 .fixed_pos(response.rect.left_top() + Vec2::new(12.0, 34.0))
                 .order(egui::Order::Foreground)
                 .show(&ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(pal.surface)
+                        .stroke(Stroke::new(1.0, pal.border))
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .inner_margin(egui::Margin::symmetric(6, 4))
+                        .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         if ui.add_enabled(!self.back.is_empty(), egui::Button::new("← Quay lại")).clicked() {
                             back_click = true;
@@ -1356,6 +1378,7 @@ impl eframe::App for App {
                             fit_click = true;
                         }
                     });
+                        });
                 });
             if let Some(f) = zoom_step {
                 self.zoom_at(response.rect.size() / 2.0, f);
@@ -1430,7 +1453,7 @@ impl eframe::App for App {
                         let s = self.zoom.max(0.4);
                         let tone = hex(LAYER_COLORS[li % LAYER_COLORS.len()]);
                         card_shadow(&painter, rect, 12.0 * s);
-                        painter.rect(rect, 12.0 * s, mix(pal.surface, tone, 0.07), Stroke::new(1.0, mix(pal.surface, tone, 0.4)), egui::StrokeKind::Inside);
+                        painter.rect(rect, 12.0 * s, mix(pal.surface, tone, 0.04), Stroke::new(1.0, mix(pal.surface, tone, 0.3)), egui::StrokeKind::Inside);
                         let inner = painter.with_clip_rect(rect.shrink(4.0));
                         inner.text(rect.min + Vec2::new(16.0 * s, 16.0 * s), Align2::LEFT_TOP, truncate(&layer.name, 24), FontId::new(19.0 * s, egui::FontFamily::Name("semibold".into())), pal.ink);
                         inner.text(rect.min + Vec2::new(16.0 * s, 46.0 * s), Align2::LEFT_TOP, truncate(&layer.description, 48), FontId::proportional(12.0 * s), pal.muted);
@@ -1464,7 +1487,7 @@ impl eframe::App for App {
                         } else if is_hit {
                             Color32::from_rgb(255, 236, 170)
                         } else {
-                            mix(pal.surface, tone, 0.06)
+                            mix(pal.surface, tone, 0.035)
                         };
                         let border_col = if changed {
                             pal.diff_changed
@@ -1473,7 +1496,7 @@ impl eframe::App for App {
                         } else if selected {
                             pal.accent
                         } else {
-                            mix(pal.surface, tone, 0.35)
+                            mix(pal.surface, tone, 0.25)
                         };
                         let border = if selected || changed || affected { 2.0 } else { 1.0 };
                         let s = self.zoom.max(0.5);
@@ -1482,8 +1505,8 @@ impl eframe::App for App {
                         let inner = painter.with_clip_rect(rect.shrink(3.0));
                         inner.text(rect.min + Vec2::new(12.0 * s, 8.0 * s), Align2::LEFT_TOP, truncate(&node.name, 28), FontId::new(13.0 * s, egui::FontFamily::Name("medium".into())), pal.ink);
                         if self.zoom >= 0.45 {
-                            inner.text(rect.min + Vec2::new(12.0 * s, 27.0 * s), Align2::LEFT_TOP, &node.kind, FontId::new(10.0 * s, egui::FontFamily::Name("semibold".into())), tone);
-                            inner.text(rect.min + Vec2::new(12.0 * s, 44.0 * s), Align2::LEFT_TOP, truncate(&node.summary, 40), FontId::proportional(10.5 * s), pal.muted);
+                            inner.text(rect.min + Vec2::new(12.0 * s, 27.0 * s), Align2::LEFT_TOP, &node.kind, FontId::new(11.0 * s, egui::FontFamily::Name("semibold".into())), tone);
+                            inner.text(rect.min + Vec2::new(12.0 * s, 46.0 * s), Align2::LEFT_TOP, truncate(&node.summary, 38), FontId::proportional(11.5 * s), pal.muted);
                         }
                         if resp.clicked() {
                             next_node = Some(ni);
@@ -1595,7 +1618,7 @@ fn main() -> eframe::Result<()> {
     let path = std::env::args().nth(1).unwrap_or_else(|| ".ua/knowledge-graph.json".into());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 700.0])
+            .with_inner_size([1040.0, 620.0])
             .with_position([16.0, 16.0])
             .with_title("Understand — ua-viewer"),
         ..Default::default()

@@ -5,5 +5,6 @@
   "author": { "name": "theblacknull" },
   "repository": "https://github.com/theblacknull/Code-Maps",
   "license": "MIT",
+  "icon": "./assets/icon.png",
   "keywords": ["knowledge-graph", "architecture", "viewer", "rust", "egui"]
 }
