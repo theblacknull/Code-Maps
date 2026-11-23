@@ -65,3 +65,10 @@ git push origin v0.1.0
 ### Licence
 
 MIT
+
+### What the cards show
+
+- Each function or class is a card with its signature (read from the source), incoming connections on the left (← caller) and outgoing connections on the right (callee →).
+- A file is a larger card that contains its functions and classes.
+- Calls between functions are derived by matching function names in the source, so they are a heuristic and can miss or over-report calls with common names.
+- Open one layer directly: `ua-viewer <knowledge-graph.json> --layer "<layer name>"`.
