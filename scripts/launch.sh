@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Launch ua-viewer for the current platform.
 # Order: bundled binary -> download from this version's GitHub Release -> build from source.
-# Usage: launch.sh <path/to/knowledge-graph.json>
+# Usage: launch.sh <path/to/knowledge-graph.json> [--layer "<tên layer>"]
 set -euo pipefail
 
 GRAPH="${1:-.ua/knowledge-graph.json}"
@@ -49,4 +49,4 @@ if [ ! -x "$BIN" ] && [ ! -f "$BIN" ]; then
   fi
 fi
 
-exec "$BIN" "$GRAPH"
+exec "$BIN" "$GRAPH" "${@:2}"

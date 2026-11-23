@@ -254,12 +254,25 @@ enum CardKind {
     Node(usize),
     /// Cổng nối sang layer khác (PortalNode.tsx)
     Portal(usize),
+    /// Khối lớn (file) chứa các hàm/class con (lồng nhau)
+    Group(usize),
 }
 
 struct Card {
     kind: CardKind,
     rect: Rect,
+    /// Chỉ số thẻ khối lớn chứa thẻ này (nếu có)
+    parent: Option<usize>,
 }
+
+const NODE_W: f32 = 250.0;
+const NODE_HEAD: f32 = 58.0;
+const ROW_H: f32 = 18.0;
+/// Số dòng kết nối hiển thị trong một thẻ; phần thừa gộp vào dòng cuối "+n more".
+const MAX_ROWS: usize = 6;
+const GROUP_HEAD: f32 = 46.0;
+const GROUP_PAD: f32 = 14.0;
+const GAP: f32 = 12.0;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum ViewSource {
@@ -298,6 +311,14 @@ struct App {
     highlight: HashSet<String>,
     path_nodes: HashSet<String>,
     show_all_edges: bool,
+    /// Đầu ra (node, loại cạnh) của từng node: node này gọi / phụ thuộc vào
+    outs: Vec<Vec<(usize, String)>>,
+    /// Đầu vào (node, loại cạnh) của từng node: ai gọi / phụ thuộc vào node này
+    ins: Vec<Vec<(usize, String)>>,
+    /// Khối cha (file) của một hàm/class theo cạnh "contains"
+    parent_of: Vec<Option<usize>>,
+    /// Chữ ký hàm đọc từ mã nguồn, theo id node
+    sigs: HashMap<String, String>,
     minimap: bool,
 
     query: String,
@@ -368,6 +389,10 @@ impl App {
             highlight: HashSet::new(),
             path_nodes: HashSet::new(),
             show_all_edges: false,
+            outs: Vec::new(),
+            ins: Vec::new(),
+            parent_of: Vec::new(),
+            sigs: HashMap::new(),
             minimap: false,
             query: String::new(),
             search_hits: Vec::new(),
@@ -428,6 +453,27 @@ impl App {
         }
         let mut links: Vec<(usize, usize, usize)> = pair.into_iter().map(|((a, b), c)| (a, b, c)).collect();
         links.sort();
+
+        // Đầu vào / đầu ra theo từng node; "contains" cho biết khối cha (file) của hàm/class.
+        let mut ins = vec![Vec::new(); graph.nodes.len()];
+        let mut outs = vec![Vec::new(); graph.nodes.len()];
+        let mut parent_of = vec![None; graph.nodes.len()];
+        for e in &graph.edges {
+            if let (Some(&s), Some(&t)) = (self.by_id.get(&e.source), self.by_id.get(&e.target)) {
+                if e.kind == "contains" {
+                    parent_of[t] = Some(s);
+                    continue;
+                }
+                if e.kind == "exports" {
+                    continue;
+                }
+                outs[s].push((t, e.kind.clone()));
+                ins[t].push((s, e.kind.clone()));
+            }
+        }
+        self.ins = ins;
+        self.outs = outs;
+        self.parent_of = parent_of;
         self.graph = graph;
         self.layer_of_node = layer_of_node;
         self.degree = degree;
@@ -494,7 +540,7 @@ impl App {
                 let pos = overview_positions(self.graph.layers.len(), &self.layer_links);
                 for (i, p) in pos.iter().enumerate() {
                     let at = self.pos_override.get(&(0, i)).copied().unwrap_or(Pos2::new(p.0, p.1));
-                    self.cards.push(Card { kind: CardKind::Layer(i), rect: Rect::from_min_size(at, Vec2::new(300.0, 150.0)) });
+                    self.cards.push(Card { kind: CardKind::Layer(i), rect: Rect::from_min_size(at, Vec2::new(300.0, 150.0)), parent: None });
                 }
                 for &(a, b, c) in &self.layer_links {
                     self.view_links.push((a, b, 1.0 + (c as f32).sqrt().min(6.0) * 0.6));
@@ -502,42 +548,131 @@ impl App {
             }
             Level::Layer(li) => {
                 let members: Vec<usize> = (0..self.graph.nodes.len())
-                    .filter(|&i| self.layer_of_node[i] == Some(li) && self.node_visible(i))
+                    .filter(|&i| (self.layer_of_node[i] == Some(li) || self.parent_of[i].is_some_and(|p| self.layer_of_node[p] == Some(li))) && self.node_visible(i))
                     .collect();
-                let local: HashMap<usize, usize> = members.iter().enumerate().map(|(k, &i)| (i, k)).collect();
-                let ids: Vec<String> = members.iter().map(|&i| self.graph.nodes[i].id.clone()).collect();
-                let dims: Vec<(f32, f32)> = members
+                let member_set: HashSet<usize> = members.iter().copied().collect();
+                // Khối cha (file) có trong layer này sẽ chứa các hàm/class con.
+                let mut kids: HashMap<usize, Vec<usize>> = HashMap::new();
+                for &i in &members {
+                    if let Some(p) = self.parent_of[i] {
+                        if member_set.contains(&p) {
+                            kids.entry(p).or_default().push(i);
+                        }
+                    }
+                }
+                let tops: Vec<usize> = members
                     .iter()
-                    .map(|&i| {
-                        let (w, h) = layout::node_dims(self.degree[i]);
-                        (w * 0.7, h * 0.7)
-                    })
+                    .copied()
+                    .filter(|&i| !self.parent_of[i].is_some_and(|p| member_set.contains(&p)))
                     .collect();
-                let community = vec![None; members.len()];
+
+                // Kích thước từng khối cấp cao nhất và vị trí các thẻ con bên trong.
+                let mut items: Vec<(usize, Vec2, Vec<(usize, Vec2)>)> = Vec::new();
+                for &t in &tops {
+                    if let Some(ch) = kids.get(&t) {
+                        let mut ch = ch.clone();
+                        ch.sort_by_key(|&c| std::cmp::Reverse(self.degree[c]));
+                        let cols = if ch.len() > 6 { 2 } else { 1 };
+                        let nrows = ch.len().div_ceil(cols);
+                        let mut rowh = vec![0.0f32; nrows];
+                        for (k, &c) in ch.iter().enumerate() {
+                            rowh[k / cols] = rowh[k / cols].max(self.node_size(c).y);
+                        }
+                        let w = GROUP_PAD * 2.0 + cols as f32 * NODE_W + (cols as f32 - 1.0) * GAP;
+                        let h = GROUP_HEAD + rowh.iter().sum::<f32>() + (nrows as f32 - 1.0) * GAP + GROUP_PAD;
+                        let mut offs = Vec::new();
+                        let mut y = GROUP_HEAD;
+                        for r in 0..nrows {
+                            for (k, &c) in ch.iter().enumerate().filter(|(k, _)| k / cols == r) {
+                                offs.push((c, Vec2::new(GROUP_PAD + (k % cols) as f32 * (NODE_W + GAP), y)));
+                            }
+                            y += rowh[r] + GAP;
+                        }
+                        items.push((t, Vec2::new(w, h), offs));
+                    } else {
+                        items.push((t, self.node_size(t), Vec::new()));
+                    }
+                }
+
+                // Bố cục lực trên các khối cấp cao nhất; cạnh giữa các con được nâng lên khối cha.
+                let idx: HashMap<usize, usize> = items.iter().enumerate().map(|(k, it)| (it.0, k)).collect();
+                let ids: Vec<String> = items.iter().map(|it| self.graph.nodes[it.0].id.clone()).collect();
+                let dims: Vec<(f32, f32)> = items.iter().map(|it| (it.1.x, it.1.y)).collect();
+                let community = vec![None; ids.len()];
+                let top_of = |x: usize| -> usize {
+                    match self.parent_of[x] {
+                        Some(p) if member_set.contains(&p) => p,
+                        _ => x,
+                    }
+                };
                 let mut links = Vec::new();
                 for e in &self.graph.edges {
-                    if !self.edge_visible(e) {
+                    if !self.edge_visible(e) || e.kind == "contains" {
                         continue;
                     }
                     if let (Some(&s), Some(&t)) = (self.by_id.get(&e.source), self.by_id.get(&e.target)) {
-                        if let (Some(&ls), Some(&lt)) = (local.get(&s), local.get(&t)) {
-                            links.push((ls, lt));
-                            self.view_links.push((ls, lt, 1.0));
+                        if !member_set.contains(&s) || !member_set.contains(&t) {
+                            continue;
+                        }
+                        let (ts, tt) = (top_of(s), top_of(t));
+                        if ts != tt {
+                            if let (Some(&a), Some(&b)) = (idx.get(&ts), idx.get(&tt)) {
+                                links.push((a, b));
+                            }
                         }
                     }
                 }
                 let pos = layout::force_layout(&layout::Input { ids: &ids, dims: &dims, community: &community, links: &links });
-                for (k, &i) in members.iter().enumerate() {
-                    let (w, h) = dims[k];
-                    let at = self.pos_override.get(&(1, i)).copied().unwrap_or(Pos2::new(pos[k].0, pos[k].1));
-                    self.cards.push(Card { kind: CardKind::Node(i), rect: Rect::from_min_size(at, Vec2::new(w, h)) });
+                // Khử chồng lấp: đẩy các khối ra xa nhau (kể cả khi lực đẩy chưa đủ).
+                let mut base: Vec<Pos2> = (0..items.len()).map(|k| Pos2::new(pos[k].0, pos[k].1)).collect();
+                for _ in 0..120 {
+                    let mut moved = false;
+                    for a in 0..items.len() {
+                        for b in (a + 1)..items.len() {
+                            let ra = Rect::from_min_size(base[a], items[a].1).expand(18.0);
+                            let rb = Rect::from_min_size(base[b], items[b].1);
+                            if !ra.intersects(rb) {
+                                continue;
+                            }
+                            moved = true;
+                            let dx = ra.max.x.min(rb.max.x) - ra.min.x.max(rb.min.x);
+                            let dy = ra.max.y.min(rb.max.y) - ra.min.y.max(rb.min.y);
+                            let (ca, cb) = (base[a] + items[a].1 / 2.0, base[b] + items[b].1 / 2.0);
+                            if dx < dy {
+                                let s = if ca.x <= cb.x { 1.0 } else { -1.0 };
+                                base[a].x -= s * dx / 2.0;
+                                base[b].x += s * dx / 2.0;
+                            } else {
+                                let s = if ca.y <= cb.y { 1.0 } else { -1.0 };
+                                base[a].y -= s * dy / 2.0;
+                                base[b].y += s * dy / 2.0;
+                            }
+                        }
+                    }
+                    if !moved {
+                        break;
+                    }
                 }
+
+                for (k, (t, size, offs)) in items.iter().enumerate() {
+                    let is_group = kids.contains_key(t);
+                    let key = if is_group { (3u8, *t) } else { (1u8, *t) };
+                    let at = self.pos_override.get(&key).copied().unwrap_or(base[k]);
+                    let kind = if is_group { CardKind::Group(*t) } else { CardKind::Node(*t) };
+                    self.cards.push(Card { kind, rect: Rect::from_min_size(at, *size), parent: None });
+                    let gi = self.cards.len() - 1;
+                    for (c, off) in offs {
+                        let cs = self.node_size(*c);
+                        self.cards.push(Card { kind: CardKind::Node(*c), rect: Rect::from_min_size(at + *off, cs), parent: Some(gi) });
+                    }
+                }
+
                 // Cổng nối: đặt ở bên phải khối node, xếp dọc.
                 if let Some(bounds) = self.cards.iter().map(|c| c.rect).reduce(|a, b| a.union(b)) {
                     for (k, (other, _count)) in self.portals_of(li).into_iter().enumerate() {
                         let pos = Pos2::new(bounds.max.x + 120.0, bounds.min.y + k as f32 * 96.0);
                         let at = self.pos_override.get(&(2, other)).copied().unwrap_or(pos);
-                        self.cards.push(Card { kind: CardKind::Portal(other), rect: Rect::from_min_size(at, Vec2::new(230.0, 70.0)) });
+                        self.cards.push(Card { kind: CardKind::Portal(other), rect: Rect::from_min_size(at, Vec2::new(230.0, 70.0)), parent: None });
                     }
                 }
             }
@@ -607,6 +742,15 @@ impl App {
         self.zoom = new_zoom;
         self.pan = anchor - before * new_zoom;
         self.fit_pending = 0;
+    }
+
+    /// Số dòng kết nối hiển thị của một node (tối thiểu 1, tối đa MAX_ROWS).
+    fn node_rows(&self, ni: usize) -> usize {
+        self.ins[ni].len().max(self.outs[ni].len()).clamp(1, MAX_ROWS)
+    }
+
+    fn node_size(&self, ni: usize) -> Vec2 {
+        Vec2::new(NODE_W, NODE_HEAD + self.node_rows(ni) as f32 * ROW_H + 8.0)
     }
 
     fn card_screen_rect(&self, origin: Pos2, r: Rect) -> Rect {
@@ -732,6 +876,7 @@ impl App {
                 for c in &self.cards {
                     let (x, y) = off(c.rect.min);
                     let label = match c.kind {
+                        CardKind::Group(ni) => self.graph.nodes[ni].name.clone(),
                         CardKind::Layer(li) => self.graph.layers[li].name.clone(),
                         CardKind::Node(ni) => self.graph.nodes[ni].name.clone(),
                         CardKind::Portal(li) => self.graph.layers[li].name.clone(),
@@ -771,7 +916,8 @@ impl App {
             .map_err(|e| e.to_string())
             .and_then(|s| serde_json::from_str::<Graph>(&s).map_err(|e| e.to_string()));
         match parsed {
-            Ok(g) => {
+            Ok(mut g) => {
+                self.sigs = enrich(&mut g, &project_root);
                 self.diff = std::fs::read_to_string(ua_dir.join("diff-overlay.json"))
                     .ok()
                     .and_then(|s| serde_json::from_str::<DiffOverlay>(&s).ok());
@@ -807,6 +953,81 @@ impl App {
     fn source_label(&self) -> String {
         self.project_root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "knowledge graph".into())
     }
+}
+
+/// Đọc chữ ký hàm từ mã nguồn (fn / def) và suy ra cạnh "calls" giữa các hàm trong dự án
+/// bằng cách tìm tên hàm được gọi trong thân hàm. Cạnh mới được thêm vào `g.edges`.
+/// Trả về: id node → chữ ký.
+fn enrich(g: &mut Graph, root: &std::path::Path) -> HashMap<String, String> {
+    let mut sigs = HashMap::new();
+    let re_fn = match regex::Regex::new(r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(fn|def)\s+([A-Za-z_]\w*)\s*(?:<[^>]*>)?\s*\(([^)]*)\)(\s*->\s*[^{:\n]+)?") {
+        Ok(r) => r,
+        Err(_) => return sigs,
+    };
+    let re_call = regex::Regex::new(r"([A-Za-z_]\w*)\s*\(").expect("regex hợp lệ");
+
+    let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut by_file: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, n) in g.nodes.iter().enumerate() {
+        if n.kind == "function" {
+            by_name.entry(n.name.clone()).or_default().push(i);
+            if let Some(f) = &n.file_path {
+                by_file.entry(f.clone()).or_default().push(i);
+            }
+        }
+    }
+
+    let mut new_edges: Vec<Edge> = Vec::new();
+    let mut seen: HashSet<(usize, usize)> = HashSet::new();
+    for (file, fn_ids) in &by_file {
+        let Ok(text) = std::fs::read_to_string(root.join(file)) else {
+            continue;
+        };
+        // Các chữ ký trong file theo thứ tự xuất hiện: (vị trí, tên, chữ ký)
+        let found: Vec<(usize, String, String)> = re_fn
+            .captures_iter(&text)
+            .map(|c| {
+                let start = c.get(0).map(|m| m.start()).unwrap_or(0);
+                let kw = c.get(1).map(|m| m.as_str()).unwrap_or("fn");
+                let name = c.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
+                let params = c.get(3).map(|m| m.as_str().split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+                let ret = c.get(4).map(|m| m.as_str().split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+                let sig = format!("{kw} {name}({params}){}", if ret.is_empty() { String::new() } else { format!(" {ret}") });
+                (start, name.clone(), sig)
+            })
+            .collect();
+
+        for &i in fn_ids {
+            let name = g.nodes[i].name.clone();
+            let Some(k) = found.iter().position(|(_, n, _)| *n == name) else {
+                continue;
+            };
+            sigs.insert(g.nodes[i].id.clone(), found[k].2.clone());
+            let end = found.get(k + 1).map(|f| f.0).unwrap_or(text.len());
+            let body = &text[found[k].0..end];
+            for c in re_call.captures_iter(body) {
+                let callee = c.get(1).map(|m| m.as_str()).unwrap_or("");
+                if callee == name || callee.len() < 3 {
+                    continue;
+                }
+                let Some(cands) = by_name.get(callee) else {
+                    continue;
+                };
+                let target = cands
+                    .iter()
+                    .copied()
+                    .find(|&t| g.nodes[t].file_path == g.nodes[i].file_path)
+                    .or(if cands.len() == 1 { Some(cands[0]) } else { None });
+                if let Some(t) = target {
+                    if seen.insert((i, t)) {
+                        new_edges.push(Edge { source: g.nodes[i].id.clone(), target: g.nodes[t].id.clone(), kind: "calls".into() });
+                    }
+                }
+            }
+        }
+    }
+    g.edges.extend(new_edges);
+    sigs
 }
 
 /// Bố cục tổng quan: các layer xếp thành cột theo khoảng cách (BFS) từ layer nối nhiều nhất,
@@ -1062,7 +1283,6 @@ impl eframe::App for App {
                         });
                         ui.separator();
                         ui.checkbox(&mut self.minimap, "Bản đồ nhỏ (M)");
-                        ui.checkbox(&mut self.show_all_edges, "Hiện mọi cạnh");
                         if self.diff.is_some() {
                             ui.checkbox(&mut self.diff_on, "Hiện thay đổi (diff)");
                         }
@@ -1136,30 +1356,36 @@ impl eframe::App for App {
                         if node.file_path.is_some() && ui.button("Xem mã nguồn").clicked() {
                             self.load_code(i);
                         }
+                        if let Some(sig) = self.sigs.get(&node.id) {
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new(sig).monospace().size(12.0));
+                        }
                         ui.separator();
-                        ui.strong("Kết nối");
-                        egui::ScrollArea::vertical().id_salt("conn").show(ui, |ui| {
-                            let id = node.id.clone();
-                            let mut clicked = None;
-                            for e in &self.graph.edges {
-                                if !self.edge_visible(e) {
-                                    continue;
-                                }
-                                let (text, other) = if e.source == id {
-                                    (format!("→ {} ({})", self.name_of(&e.target), e.kind), e.target.clone())
-                                } else if e.target == id {
-                                    (format!("← {} ({})", self.name_of(&e.source), e.kind), e.source.clone())
-                                } else {
-                                    continue;
-                                };
-                                if ui.selectable_label(false, text).clicked() {
-                                    clicked = self.by_id.get(&other).copied();
-                                }
+                        // Đầu vào: ai gọi / phụ thuộc vào node này
+                        ui.strong(format!("Đầu vào ({})", self.ins[i].len()));
+                        let mut clicked = None;
+                        for (o, kind) in self.ins[i].clone() {
+                            if ui.selectable_label(false, format!("← {}  ({})", self.graph.nodes[o].name, kind)).clicked() {
+                                clicked = Some(o);
                             }
-                            if let Some(ni) = clicked {
-                                self.navigate_to_node(ni);
+                        }
+                        if self.ins[i].is_empty() {
+                            ui.label(egui::RichText::new("Không có.").color(pal.muted));
+                        }
+                        ui.add_space(8.0);
+                        // Đầu ra: node này gọi / phụ thuộc vào ai
+                        ui.strong(format!("Đầu ra ({})", self.outs[i].len()));
+                        for (o, kind) in self.outs[i].clone() {
+                            if ui.selectable_label(false, format!("→ {}  ({})", self.graph.nodes[o].name, kind)).clicked() {
+                                clicked = Some(o);
                             }
-                        });
+                        }
+                        if self.outs[i].is_empty() {
+                            ui.label(egui::RichText::new("Không có.").color(pal.muted));
+                        }
+                        if let Some(ni) = clicked {
+                            self.navigate_to_node(ni);
+                        }
                     }
                 });
             });
@@ -1359,10 +1585,10 @@ impl eframe::App for App {
             } else if self.fit_pending > 0 || fit_key {
                 self.fit_pending = self.fit_pending.saturating_sub(1);
                 if let Some(b) = self.world_bounds() {
-                    let avail = response.rect.size() - Vec2::splat(40.0);
+                    let avail = response.rect.size() - Vec2::new(60.0, 150.0);
                     let z = (avail.x / b.width()).min(avail.y / b.height()).clamp(0.08, 1.2);
                     self.zoom = z;
-                    self.pan = response.rect.size() / 2.0 - b.center().to_vec2() * z;
+                    self.pan = response.rect.size() / 2.0 + Vec2::new(0.0, 40.0) - b.center().to_vec2() * z;
                 }
             }
 
@@ -1445,6 +1671,104 @@ impl eframe::App for App {
             let centers: Vec<Pos2> = screen.iter().map(|r| r.center()).collect();
             let sel_id = self.selected_node.map(|i| self.graph.nodes[i].id.clone());
 
+            // Khối lớn (file): nền và tiêu đề, vẽ trước cạnh và các thẻ con
+            for (ci, card) in self.cards.iter().enumerate() {
+                if let CardKind::Group(ni) = card.kind {
+                    let r = screen[ci];
+                    let s = self.zoom.max(0.5);
+                    let node = &self.graph.nodes[ni];
+                    let tone = node_tone(&node.kind);
+                    card_shadow(&painter, r, 12.0 * s);
+                    painter.rect(r, 12.0 * s, mix(pal.surface, tone, 0.025), Stroke::new(1.0, mix(pal.surface, tone, 0.3)), egui::StrokeKind::Inside);
+                    if self.zoom >= 0.3 {
+                        let inner = painter.with_clip_rect(r.shrink(3.0));
+                        inner.text(r.min + Vec2::new(14.0 * self.zoom, 10.0 * self.zoom), Align2::LEFT_TOP, truncate(&node.name, 34), FontId::new(14.0 * s, egui::FontFamily::Name("semibold".into())), pal.ink);
+                        inner.text(r.min + Vec2::new(14.0 * self.zoom, 30.0 * self.zoom), Align2::LEFT_TOP, truncate(node.file_path.as_deref().unwrap_or(""), 48), FontId::proportional(10.5 * s), pal.muted);
+                    }
+                }
+            }
+
+            // Cạnh trong layer: nối từ cổng đầu ra (phải) tới cổng đầu vào (trái) bằng đường cong.
+            if matches!(self.level, Level::Layer(_)) {
+                let mut card_of: HashMap<usize, usize> = HashMap::new();
+                let mut group_of: HashMap<usize, usize> = HashMap::new();
+                for (ci, c) in self.cards.iter().enumerate() {
+                    match c.kind {
+                        CardKind::Node(n) => {
+                            card_of.insert(n, ci);
+                        }
+                        CardKind::Group(n) => {
+                            group_of.insert(n, ci);
+                        }
+                        _ => {}
+                    }
+                }
+                let z = self.zoom;
+                for e in &self.graph.edges {
+                    if e.kind == "contains" || e.kind == "exports" || !self.edge_visible(e) {
+                        continue;
+                    }
+                    let (Some(&s), Some(&t)) = (self.by_id.get(&e.source), self.by_id.get(&e.target)) else {
+                        continue;
+                    };
+                    // Quan hệ cha–con đã thể hiện bằng việc lồng nhau: không vẽ lại.
+                    if self.parent_of[t] == Some(s) || self.parent_of[s] == Some(t) {
+                        continue;
+                    }
+                    let src = if let Some(&ci) = card_of.get(&s) {
+                        let r = screen[ci];
+                        let j = self.outs[s].iter().position(|(o, k)| *o == t && *k == e.kind).unwrap_or(0).min(MAX_ROWS - 1);
+                        Pos2::new(r.right(), r.top() + (NODE_HEAD + j as f32 * ROW_H + ROW_H / 2.0) * z)
+                    } else if let Some(&gi) = group_of.get(&s) {
+                        let r = screen[gi];
+                        Pos2::new(r.right(), r.top() + 22.0 * z)
+                    } else {
+                        continue;
+                    };
+                    let dst = if let Some(&ci) = card_of.get(&t) {
+                        let r = screen[ci];
+                        let j = self.ins[t].iter().position(|(o, k)| *o == s && *k == e.kind).unwrap_or(0).min(MAX_ROWS - 1);
+                        Pos2::new(r.left(), r.top() + (NODE_HEAD + j as f32 * ROW_H + ROW_H / 2.0) * z)
+                    } else if let Some(&gi) = group_of.get(&t) {
+                        let r = screen[gi];
+                        Pos2::new(r.left(), r.top() + 22.0 * z)
+                    } else {
+                        continue;
+                    };
+                    let on_path = self.path_nodes.contains(&e.source) && self.path_nodes.contains(&e.target);
+                    let incident = self.selected_node.is_some_and(|i| i == s || i == t) || self.highlight.contains(&e.source) || self.highlight.contains(&e.target);
+                    let stroke = if on_path {
+                        Stroke::new(3.0, pal.accent)
+                    } else if incident {
+                        Stroke::new(2.0, pal.accent)
+                    } else {
+                        Stroke::new(1.3, mix(pal.edge, pal.ink, 0.3))
+                    };
+                    let dx = ((dst.x - src.x).abs() * 0.5).max(30.0 * z);
+                    let pts: Vec<Pos2> = (0..=24)
+                        .map(|k| {
+                            let u = k as f32 / 24.0;
+                            let v = 1.0 - u;
+                            let p0 = src;
+                            let p1 = src + Vec2::new(dx, 0.0);
+                            let p2 = dst - Vec2::new(dx, 0.0);
+                            let p3 = dst;
+                            Pos2::new(
+                                v * v * v * p0.x + 3.0 * v * v * u * p1.x + 3.0 * v * u * u * p2.x + u * u * u * p3.x,
+                                v * v * v * p0.y + 3.0 * v * v * u * p1.y + 3.0 * v * u * u * p2.y + u * u * u * p3.y,
+                            )
+                        })
+                        .collect();
+                    if e.kind == "calls" {
+                        painter.add(egui::Shape::line(pts, stroke));
+                    } else {
+                        painter.extend(egui::Shape::dashed_line(&pts, stroke, 6.0, 4.0));
+                    }
+                    painter.circle_filled(src, 3.0, stroke.color);
+                    painter.circle_filled(dst, 3.0, stroke.color);
+                }
+            }
+
             // Cạnh
             for &(a, b, width) in &self.view_links {
                 let (pa, pb) = (centers[a], centers[b]);
@@ -1479,7 +1803,9 @@ impl eframe::App for App {
             let mut code_req = None;
             for (ci, card) in self.cards.iter().enumerate() {
                 let rect = screen[ci];
-                let resp = ui.interact(rect, Id::new(("card", ci)), Sense::click_and_drag());
+                // Thẻ con trong khối không kéo riêng: kéo khối cha để di chuyển cả nhóm.
+                let sense = if card.parent.is_some() { Sense::click() } else { Sense::click_and_drag() };
+                let resp = ui.interact(rect, Id::new(("card", ci)), sense);
                 if resp.dragged() {
                     drags.push((ci, resp.drag_delta()));
                 }
@@ -1497,6 +1823,9 @@ impl eframe::App for App {
                         if resp.clicked() {
                             next_level = Some(li);
                         }
+                    }
+                    CardKind::Group(_) => {
+                        // Nền và tiêu đề đã vẽ ở bước trước; chỉ xử lý tương tác ở đây.
                     }
                     CardKind::Portal(other) => {
                         let s = self.zoom.max(0.4);
@@ -1536,13 +1865,40 @@ impl eframe::App for App {
                         };
                         let border = if selected || changed || affected { 2.0 } else { 1.0 };
                         let s = self.zoom.max(0.5);
+                        let z = self.zoom;
                         card_shadow(&painter, rect, 8.0 * s);
                         painter.rect(rect, 8.0 * s, fill, Stroke::new(border, border_col), egui::StrokeKind::Inside);
                         let inner = painter.with_clip_rect(rect.shrink(3.0));
-                        inner.text(rect.min + Vec2::new(12.0 * s, 8.0 * s), Align2::LEFT_TOP, truncate(&node.name, 28), FontId::new(13.0 * s, egui::FontFamily::Name("medium".into())), pal.ink);
-                        if self.zoom >= 0.45 {
-                            inner.text(rect.min + Vec2::new(12.0 * s, 27.0 * s), Align2::LEFT_TOP, &node.kind, FontId::new(11.0 * s, egui::FontFamily::Name("semibold".into())), tone);
-                            inner.text(rect.min + Vec2::new(12.0 * s, 46.0 * s), Align2::LEFT_TOP, truncate(&node.summary, 38), FontId::proportional(11.5 * s), pal.muted);
+                        inner.text(rect.min + Vec2::new(12.0 * z, 8.0 * z), Align2::LEFT_TOP, truncate(&node.name, 30), FontId::new(13.0 * s, egui::FontFamily::Name("medium".into())), pal.ink);
+                        if self.zoom >= 0.3 {
+                            inner.text(rect.min + Vec2::new(12.0 * z, 27.0 * z), Align2::LEFT_TOP, &node.kind, FontId::new(11.0 * s, egui::FontFamily::Name("semibold".into())), tone);
+                            let sig = self.sigs.get(&node.id).map(|x| x.as_str()).unwrap_or(node.summary.as_str());
+                            inner.text(rect.min + Vec2::new(12.0 * z, 42.0 * z), Align2::LEFT_TOP, truncate(sig, 36), FontId::monospace(10.5 * s), pal.muted);
+                            // Các dòng kết nối: trái = đầu vào (← ai gọi), phải = đầu ra (→ gọi ai)
+                            let overflow_in = self.ins[ni].len() > MAX_ROWS;
+                            let overflow_out = self.outs[ni].len() > MAX_ROWS;
+                            for r in 0..self.node_rows(ni) {
+                                let y = rect.min.y + (NODE_HEAD + r as f32 * ROW_H + ROW_H / 2.0) * z;
+                                let left = if overflow_in && r == MAX_ROWS - 1 {
+                                    format!("+{} more", self.ins[ni].len() - (MAX_ROWS - 1))
+                                } else {
+                                    self.ins[ni].get(r).map(|(o, _)| format!("← {}", truncate(&self.graph.nodes[*o].name, 18))).unwrap_or_default()
+                                };
+                                let right = if overflow_out && r == MAX_ROWS - 1 {
+                                    format!("+{} more", self.outs[ni].len() - (MAX_ROWS - 1))
+                                } else {
+                                    self.outs[ni].get(r).map(|(o, _)| format!("{} →", truncate(&self.graph.nodes[*o].name, 18))).unwrap_or_default()
+                                };
+                                inner.text(Pos2::new(rect.min.x + 12.0 * z, y), Align2::LEFT_CENTER, left, FontId::proportional(11.0 * s), pal.ink);
+                                inner.text(Pos2::new(rect.max.x - 12.0 * z, y), Align2::RIGHT_CENTER, right, FontId::proportional(11.0 * s), pal.ink);
+                            }
+                            // Cổng: chấm tròn ở mép trái (đầu vào) và mép phải (đầu ra)
+                            if !self.ins[ni].is_empty() {
+                                painter.circle_filled(Pos2::new(rect.min.x, rect.min.y + (NODE_HEAD + ROW_H / 2.0) * z), 3.5, tone);
+                            }
+                            if !self.outs[ni].is_empty() {
+                                painter.circle_filled(Pos2::new(rect.max.x, rect.min.y + (NODE_HEAD + ROW_H / 2.0) * z), 3.5, tone);
+                            }
                         }
                         if resp.clicked() {
                             next_node = Some(ni);
@@ -1552,12 +1908,15 @@ impl eframe::App for App {
                         }
                         let name = node.name.clone();
                         let kind = node.kind.clone();
-                        let summary = node.summary.clone();
+                        let summary = self.sigs.get(&node.id).cloned().unwrap_or_else(|| node.summary.clone());
                         let has_file = node.file_path.is_some();
+                        let n_in = self.ins[ni].len();
+                        let n_out = self.outs[ni].len();
                         resp.on_hover_ui(|ui| {
                             ui.strong(&name);
                             ui.label(egui::RichText::new(&kind).color(pal.muted));
-                            ui.label(truncate(&summary, 160));
+                            ui.label(egui::RichText::new(truncate(&summary, 160)).monospace());
+                            ui.label(egui::RichText::new(format!("{n_in} đầu vào · {n_out} đầu ra")).color(pal.muted).small());
                             if has_file {
                                 ui.label(egui::RichText::new("Nhấp đúp để xem mã nguồn").color(pal.muted).small());
                             }
@@ -1571,8 +1930,17 @@ impl eframe::App for App {
                     CardKind::Layer(i) => (0u8, i),
                     CardKind::Node(i) => (1u8, i),
                     CardKind::Portal(i) => (2u8, i),
+                    CardKind::Group(i) => (3u8, i),
                 };
                 let moved = self.cards[ci].rect.translate(d / self.zoom);
+                if matches!(self.cards[ci].kind, CardKind::Group(_)) {
+                    // Kéo khối cha: các thẻ con đi cùng
+                    for j in 0..self.cards.len() {
+                        if self.cards[j].parent == Some(ci) {
+                            self.cards[j].rect = self.cards[j].rect.translate(d / self.zoom);
+                        }
+                    }
+                }
                 self.cards[ci].rect = moved;
                 self.pos_override.insert(key, moved.min);
                 self.fit_pending = 0;
@@ -1581,6 +1949,8 @@ impl eframe::App for App {
                 self.enter_layer(li);
             } else if let Some(ni) = next_node {
                 self.selected_node = Some(ni);
+                // Chọn một node thì mở panel chi tiết (đầu vào / đầu ra)
+                self.show_right = true;
             }
             if let Some(ni) = code_req {
                 self.selected_node = Some(ni);
@@ -1600,6 +1970,7 @@ impl eframe::App for App {
                             CardKind::Layer(li) => hex(LAYER_COLORS[li % LAYER_COLORS.len()]),
                             CardKind::Portal(li) => hex(LAYER_COLORS[li % LAYER_COLORS.len()]),
                             CardKind::Node(_) => pal.muted,
+                            CardKind::Group(_) => pal.border,
                         };
                         painter.rect_filled(r, 1.0, col);
                     }
@@ -1651,7 +2022,9 @@ fn pick_node(ui: &mut egui::Ui, salt: &str, names: &[(usize, String)], sel: &mut
 }
 
 fn main() -> eframe::Result<()> {
-    let path = std::env::args().nth(1).unwrap_or_else(|| ".ua/knowledge-graph.json".into());
+    let args: Vec<String> = std::env::args().collect();
+    let path = args.get(1).cloned().unwrap_or_else(|| ".ua/knowledge-graph.json".into());
+    let layer = args.iter().position(|a| a == "--layer").and_then(|i| args.get(i + 1).cloned());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1040.0, 620.0])
@@ -1664,7 +2037,14 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             setup_fonts(&cc.egui_ctx);
-            Ok(Box::new(App::new(&path)))
+            let mut app = App::new(&path);
+            // Tùy chọn: ua-viewer <file> --layer "<tên layer>" mở thẳng một layer
+            if let Some(name) = layer.as_ref() {
+                if let Some(i) = app.graph.layers.iter().position(|l| &l.name == name) {
+                    app.enter_layer(i);
+                }
+            }
+            Ok(Box::new(app))
         }),
     )
 }

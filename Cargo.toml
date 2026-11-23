@@ -8,6 +8,7 @@ description = "Native Rust viewer for Understand-Anything knowledge-graph.json (
 eframe = "0.37.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+regex = "1"
 rfd = "0.15"
 
 [profile.release]
